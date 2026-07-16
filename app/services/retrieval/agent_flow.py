@@ -14,6 +14,7 @@ from app.services.utils import get_openai_client
 from app.prompts.resolver import RESOLVER_SYSTEM_PROMPT
 from app.prompts.rewrite import QUERY_REWRITE_SYSTEM_PROMPT
 from app.prompts.router import TOOL_ROUTER_SYSTEM_PROMPT
+from app.prompts.answer import RAG_ANSWER_SYSTEM_PROMPT
 from app.services.user_db import UserDBService, get_user_db_service
 
 
@@ -33,7 +34,7 @@ class AgentOrchestrator:
         client, model = await get_openai_client()
 
         available_user_fields = [
-            "grade",
+            "student_grade",
             "course_of_study",
             "previous_scores",
             "strengths",
@@ -58,8 +59,37 @@ class AgentOrchestrator:
             parsed = json.loads(raw)
             return ToolDecision.model_validate(parsed)
         except Exception:
-            # Safe fallback: use retrieval
-            return ToolDecision(action="vector_db_only", reason="fallback", user_db_fields=[], search_query_hint="")
+            return ToolDecision(
+                action="vector_db_only",
+                reason="Failed to parse tool decision; defaulting to vector search.",
+                user_db_fields=[],
+                search_query_hint="",
+            )
+
+    async def answer_with_context(
+        self,
+        *,
+        user_message: str,
+        user_profile: Optional[dict],
+        retrieved_chunks: Optional[list[dict]],
+    ) -> str:
+        client, model = await get_openai_client()
+
+        payload = {
+            "user_message": user_message,
+            "user_profile": user_profile,
+            "retrieved_chunks": retrieved_chunks,
+        }
+
+        res = await client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": RAG_ANSWER_SYSTEM_PROMPT},
+                {"role": "user", "content": json.dumps(payload)},
+            ],
+            temperature=0.2,
+        )
+        return (res.choices[0].message.content or "").strip()
 
     async def handle_query(
         self,
@@ -69,7 +99,8 @@ class AgentOrchestrator:
         selected_slugs: List[str],
     ) -> Dict[str, Any]:
         """
-        POC:
+        POC: selected_slugs is treated as selected_article_ids for backwards compatibility.
+        Exactly ONE id is supported.
         """
         article_ids = selected_slugs
 
@@ -93,7 +124,6 @@ class AgentOrchestrator:
                     question=decision.clarifying_question or pending.clarifying_question,
                 )
 
-            # Continue with normal tool routing + retrieval path
             message = pending.original_question
 
         if len(article_ids) != 1:
@@ -113,30 +143,31 @@ class AgentOrchestrator:
             prof = self.user_db.get_user_profile(user_id=user_id)
             user_profile = prof.data if prof else None
 
-        if tool_decision.action == "plain_answer":
-            return {
-                "type": "plain_answer",
-                "plan": tool_decision.model_dump(),
-                "user_profile": user_profile,
-                "message": "No retrieval required for this question (POC: answer step not implemented here).",
-            }
+        retrieved_chunks: Optional[list[dict]] = None
 
-        if tool_decision.action == "user_db_only":
-            return {
-                "type": "user_db_result",
-                "plan": tool_decision.model_dump(),
-                "user_profile": user_profile,
-            }
+        if tool_decision.action in ("vector_db_only", "user_db_then_vector_db"):
+            retrieval = await self.execute_retrieval(
+                query=message,
+                article_ids=article_ids,
+                intent="single",
+            )
+            retrieved_chunks = retrieval.get("chunks") or []
 
-        # vector_db_only OR user_db_then_vector_db
-        retrieval = await self.execute_retrieval(
-            query=message,
-            article_ids=article_ids,
-            intent="single",
+        answer = await self.answer_with_context(
+            user_message=message,
+            user_profile=user_profile,
+            retrieved_chunks=retrieved_chunks,
         )
-        retrieval["plan"] = tool_decision.model_dump()
-        retrieval["user_profile"] = user_profile
-        return retrieval
+
+        return {
+            "type": "final_answer",
+            "answer": answer,
+            "plan": tool_decision.model_dump(),
+            "user_profile": user_profile,
+            "chunks": retrieved_chunks or [],
+            "query": message,
+            "article_id": article_ids[0],
+        }
 
     async def resolve_clarification(
         self,
