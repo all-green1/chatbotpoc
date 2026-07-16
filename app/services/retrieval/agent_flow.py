@@ -1,13 +1,15 @@
+from __future__ import annotations
+
 from typing import List, Dict, Any
 from loguru import logger
 import json
 
 from app.schemas.retrieval import RouterDecision
 from app.services.retrieval import agent_state
-from app.services.retrieval import VectorStoreService
-from app.services.retrieval import get_book_brief, get_openai_client
-from app.prompts import ROUTER_SYSTEM_PROMPT, RESOLVER_SYSTEM_PROMPT, QUERY_REWRITE_SYSTEM_PROMPT
-from app.schemas.books import SearchChunkResult
+from app.services.retrieval.vector_store import VectorStoreService
+from app.services.retrieval.utils import get_openai_client
+from app.prompts import RESOLVER_SYSTEM_PROMPT, QUERY_REWRITE_SYSTEM_PROMPT
+
 
 class AgentOrchestrator:
     def __init__(self, vector_store: VectorStoreService):
@@ -18,12 +20,14 @@ class AgentOrchestrator:
         session_id: str,
         user_id: str,
         message: str,
-        selected_slugs: List[str]
+        selected_slugs: List[str],
     ) -> Dict[str, Any]:
         """
-        Main gateway for processing queries with 1 or 2 selected books.
+        POC: `selected_slugs` is treated as selected_article_ids for backwards compatibility.
+        Exactly ONE id is supported.
         """
-        # 1. Handle Multi-turn State Machine
+        article_ids = selected_slugs
+
         pending = agent_state.get_pending(session_id, user_id=user_id)
 
         if pending:
@@ -32,63 +36,35 @@ class AgentOrchestrator:
                 original_q=pending.original_question,
                 clarifying_question=pending.clarifying_question,
                 clarification=message,
-                slugs=selected_slugs
+                article_ids=article_ids,
             )
             agent_state.clear_pending(session_id)
 
             if decision.intent == "uncertain":
-                # Fallback if still unclear
                 return await self.set_uncertain_state(
-                    session_id,
-                    user_id,
-                    pending.original_question,
-                    selected_slugs,
-                    decision.clarifying_question or pending.clarifying_question,
+                    session_id=session_id,
+                    user_id=user_id,
+                    original_q=pending.original_question,
+                    article_ids=article_ids,
+                    question=decision.clarifying_question or pending.clarifying_question,
                 )
 
-            return await self.execute_retrieval(pending.original_question, decision.targets, decision.intent)
-
-        # 2. Direct path for single book
-        if len(selected_slugs) == 1:
-            return await self.execute_retrieval(message, selected_slugs, "single")
-
-        # 3. Router Agent for 2 books
-        decision = await self.route_intent(message, selected_slugs)
-
-        if decision.intent == "uncertain":
-            return await self.set_uncertain_state(
-                session_id, user_id, message, selected_slugs, decision.clarifying_question
+            return await self.execute_retrieval(
+                query=pending.original_question,
+                article_ids=article_ids,
+                intent=decision.intent,
             )
 
-        return await self.execute_retrieval(message, decision.targets, decision.intent)
+        if len(article_ids) != 1:
+            return await self.set_uncertain_state(
+                session_id=session_id,
+                user_id=user_id,
+                original_q=message,
+                article_ids=article_ids,
+                question="Please select exactly one article_id for this question.",
+            )
 
-    async def route_intent(self, message: str, slugs: List[str]) -> RouterDecision:
-        client, model = await get_openai_client()
-        briefs = [await get_book_brief(self.vector_store, s) for s in slugs]
-        books_info = "\n\n".join(
-            [
-                "BOOK\n"
-                f"- slug: {b['slug']}\n"
-                f"- title: {b['title']}\n"
-                f"- language: {b['language'] or 'unknown'}\n"
-                f"- summary:\n{b['summary']}\n"
-                f"- table_of_contents:\n{b['toc']}\n"
-                for b in briefs
-            ]
-        )
-        system_prompt = ROUTER_SYSTEM_PROMPT.format(
-            books_info=books_info,
-            selected_slugs=slugs,
-        )
-        res = await client.beta.chat.completions.parse(
-            model=model,
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": message},
-            ],
-            response_format=RouterDecision,
-        )
-        return res.choices[0].message.parsed
+        return await self.execute_retrieval(query=message, article_ids=article_ids, intent="single")
 
     async def resolve_clarification(
         self,
@@ -96,35 +72,26 @@ class AgentOrchestrator:
         original_q: str,
         clarifying_question: str,
         clarification: str,
-        slugs: list[str],
+        article_ids: list[str],
     ) -> RouterDecision:
-        """
-        Resolves a user's clarification or choice in response to a question.
-        """
         client, model = await get_openai_client()
         system_prompt = RESOLVER_SYSTEM_PROMPT.format(
             clarifying_question=clarifying_question,
             original_question=original_q,
             user_answer=clarification,
-            selected_slugs=slugs,
+            selected_slugs=article_ids,
         )
         res = await client.beta.chat.completions.parse(
             model=model,
             messages=[{"role": "system", "content": system_prompt}],
-            response_format=RouterDecision
+            response_format=RouterDecision,
         )
         return res.choices[0].message.parsed
 
     async def rewrite_for_retrieval(self, *, user_message: str) -> str:
-        """
-        Uses the normal model to rewrite the user's message into a vector-search-friendly query.
-        The original user message remains authoritative for routing/clarification and final answering.
-        """
         client, model = await get_openai_client()
 
-        payload = {
-            "user_message": user_message,
-        }
+        payload = {"user_message": user_message}
 
         res = await client.chat.completions.create(
             model=model,
@@ -144,89 +111,71 @@ class AgentOrchestrator:
         except Exception:
             return ""
 
-    async def execute_retrieval(self, query: str, slugs: List[str], intent: str):
-        search_query = await self.rewrite_for_retrieval(
-            user_message=query,
-        )
+    async def execute_retrieval(
+        self,
+        *,
+        query: str,
+        article_ids: List[str],
+        intent: str,
+    ) -> Dict[str, Any]:
+        if len(article_ids) != 1:
+            return {"type": "clarification", "message": "Please select exactly one article_id for retrieval."}
+
+        article_id = (article_ids[0] or "").strip()
+        if not article_id:
+            return {"type": "clarification", "message": "Selected article_id is empty."}
+
+        search_query = await self.rewrite_for_retrieval(user_message=query)
 
         logger.info(
-            f"original_query={query[:120]!r} rewritten_query={search_query[:120]!r}"
+            f"original_query={query[:120]!r} rewritten_query={search_query[:120]!r} article_id={article_id!r}"
         )
+
         results = await self.vector_store.search_documents(
-            collection_name="new books",
+            collection_name="article",
             query=search_query,
-            slug=slugs
+            article_id=article_id,
         )
 
-        # Evidence gating ONLY for multi-book
-        gated_points = results
-        notes: List[str] = []
-
-        if len(slugs) > 1:
-            evidence_map = {s: [] for s in slugs}
-            for p in results:
-                evidence_map[p.payload["book_slug"]].append(p)
-
-            gated_points = []
-            for slug in slugs:
-                book_chunks = evidence_map[slug]
-                # Threshold: Top result must be >= 0.7 to be considered relevant
-                if not book_chunks or max(p.score for p in book_chunks) < 0.7:
-                    notes.append(
-                        f"Book '{slug}' does not contain sufficient direct evidence for this question."
-                    )
-                else:
-                    gated_points.extend(book_chunks)
-
-        if gated_points:
-            top_point = max(gated_points, key=lambda c: float(getattr(c, "score", 0.0) or 0.0))
-            top_score = float(getattr(top_point, "score", 0.0) or 0.0)
-
-            payload = getattr(top_point, "payload", None) or {}
-            content = str(payload.get("content") or "")
-            logger.info(
-                "[retrieve] top_chunk"
-                f" score={top_score:.4f}"
-                f" content_preview={content[:240]!r}"
+        chunks: List[Dict[str, Any]] = []
+        for p in results:
+            payload = getattr(p, "payload", None) or {}
+            chunks.append(
+                {
+                    "chunk_id": getattr(p, "id", None) or payload.get("id"),
+                    "content": str(payload.get("content") or ""),
+                    "confidence": float(getattr(p, "score", 0.0) or 0.0),
+                    "article_id": payload.get("article_id"),
+                    "source_type": payload.get("source_type"),
+                    "tags": payload.get("tags") or [],
+                }
             )
-        else:
-            logger.info("[retrieve] top_chunk (none) gated_points=0")
-
-        # Normalize to a stable, rich schema (similar to /relevant)
-        gated_chunks: List[Dict[str, Any]] = []
-        for p in gated_points:
-            payload = p.payload or {}
-
-            chunk = SearchChunkResult(
-                breadcrumbs=" > ".join(payload.get("breadcrumbs", []) or []),
-                page_start=int(payload.get("page_start") or 0),
-                page_end=int(payload.get("page_end") or 0),
-                content=str(payload.get("content") or ""),
-                confidence=p.score,
-            ).model_dump()
-
-            # Preserve extra details that are commonly needed downstream
-            chunk["book_slug"] = payload.get("book_slug")
-            chunk["chunk_id"] = payload.get("id")
-            chunk["section_ancestor_ids"] = payload.get("section_ancestor_ids")
-            gated_chunks.append(chunk)
 
         return {
             "type": "retrieval_result",
-            "chunks": gated_chunks,
-            "notes": notes,
+            "chunks": chunks,
+            "notes": [],
             "intent": intent,
-            "query": query
+            "query": query,
+            "article_id": article_id,
         }
 
-    async def set_uncertain_state(self, session_id, user_id, original_q, slugs, question=None):
-        clarifying_q = question
+    async def set_uncertain_state(
+        self,
+        *,
+        session_id: str,
+        user_id: str,
+        original_q: str,
+        article_ids: List[str],
+        question: str | None = None,
+    ) -> Dict[str, Any]:
+        clarifying_q = question or "Please select exactly one article_id."
         agent_state.set_pending(
             session_id=session_id,
             user_id=user_id,
-            kind="book_or_mode",
+            kind="article_id_required",
             question=original_q,
-            slugs=slugs,
-            clarification=clarifying_q
+            article_ids=article_ids,
+            clarification=clarifying_q,
         )
         return {"type": "clarification", "message": clarifying_q}

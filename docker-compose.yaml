@@ -1,0 +1,35 @@
+version: "3.9"
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.11.5
+    ports:
+      - "6333:6333"
+      - "6334:6334"
+    volumes:
+      - qdrant_data:/qdrant/storage
+    restart: unless-stopped
+
+  backend:
+    build:
+      context: .
+      dockerfile: dockerfile
+    env_file:
+      - .env
+    environment:
+      QDRANT_HOST: qdrant
+      QDRANT_PORT: "6333"
+      AGENTIC_STATE_DB_PATH: /data/agentic_state/agentic_state.db
+      EMBEDDING_MODEL_PATH: /models/gte-multilingual-base-onnx
+    volumes:
+      - agent_state_data:/data/agentic_state
+      - ./models:/models:ro
+    ports:
+      - "8000:8000"
+    depends_on:
+      - qdrant
+    restart: unless-stopped
+
+volumes:
+  qdrant_data:
+  agent_state_data:
