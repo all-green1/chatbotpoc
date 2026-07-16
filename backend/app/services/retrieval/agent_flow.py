@@ -4,15 +4,15 @@ from typing import List, Dict, Any
 from loguru import logger
 import json
 
-from app.schemas.retrieval import RouterDecision, ToolDecision
-from app.services.retrieval import agent_state
-from app.services.retrieval.vector_store import VectorStoreService
-from app.services.utils import get_openai_client
-from app.prompts.resolver import RESOLVER_SYSTEM_PROMPT
-from app.prompts.rewrite import QUERY_REWRITE_SYSTEM_PROMPT
-from app.prompts.router import TOOL_ROUTER_SYSTEM_PROMPT
-from app.prompts.answer import RAG_ANSWER_SYSTEM_PROMPT
-from app.services.user_db import UserDBService, get_user_db_service
+from backend.app.schemas.retrieval import RouterDecision, ToolDecision
+from backend.app.services.retrieval import agent_state
+from backend.app.services.retrieval.vector_store import VectorStoreService
+from backend.app.services.utils import get_openai_client
+from backend.app.prompts.resolver import RESOLVER_SYSTEM_PROMPT
+from backend.app.prompts.rewrite import QUERY_REWRITE_SYSTEM_PROMPT
+from backend.app.prompts.router import TOOL_ROUTER_SYSTEM_PROMPT
+from backend.app.prompts.answer import RAG_ANSWER_SYSTEM_PROMPT
+from backend.app.services.user_db import UserDBService, get_user_db_service
 
 class AgentOrchestrator:
     def __init__(self, vector_store: VectorStoreService, user_db: Optional[UserDBService] = None):

@@ -3,9 +3,9 @@ from fastapi import Depends, HTTPException, APIRouter
 from pydantic import BaseModel, Field
 from loguru import logger
 import urllib.request
-from app.services.embedding import get_vector_store_service
-from app.services.retrieval.vector_store import VectorStoreService
-from app.services.chunker import ChunkerService, get_chunker_service
+from backend.app.services.embedding import get_vector_store_service
+from backend.app.services.retrieval.vector_store import VectorStoreService
+from backend.app.services.chunker import ChunkerService, get_chunker_service
 
 router = APIRouter()
 

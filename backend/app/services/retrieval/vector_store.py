@@ -23,7 +23,7 @@ from qdrant_client.models import (
     VectorParams,
 )
 
-from app.core.embedder import GTETextEmbedder
+from backend.app.core.embedder import GTETextEmbedder
 
 if TYPE_CHECKING:
     import numpy as np

@@ -1,5 +1,5 @@
 .env
-app/model/
+backend/app/model/
 .DS_Store
 .idea/
 __pycache__/

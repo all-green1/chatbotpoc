@@ -7,9 +7,9 @@ from loguru import logger
 import sentry_sdk
 from qdrant_client import AsyncQdrantClient
 
-from app.core.settings import Settings
-from app.core.embedder import GTETextEmbedder
-from app.services.retrieval.vector_store import VectorStoreService
+from backend.app.core.settings import Settings
+from backend.app.core.embedder import GTETextEmbedder
+from backend.app.services.retrieval.vector_store import VectorStoreService
 
 
 @lru_cache(maxsize=1)

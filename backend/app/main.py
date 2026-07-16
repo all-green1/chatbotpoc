@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 
-from app.routers.ingest import router as ingest_router
+from backend.app.routers.ingest import router as ingest_router
 
 app = FastAPI(title="RAG POC")
 
