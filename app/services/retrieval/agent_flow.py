@@ -4,16 +4,62 @@ from typing import List, Dict, Any
 from loguru import logger
 import json
 
+from pydantic import BaseModel, Field
+
+
 from app.schemas.retrieval import RouterDecision
 from app.services.retrieval import agent_state
 from app.services.retrieval.vector_store import VectorStoreService
-from app.services.retrieval.utils import get_openai_client
-from app.prompts import RESOLVER_SYSTEM_PROMPT, QUERY_REWRITE_SYSTEM_PROMPT
+from app.services.utils import get_openai_client
+from app.prompts.resolver import RESOLVER_SYSTEM_PROMPT
+from app.prompts.rewrite import QUERY_REWRITE_SYSTEM_PROMPT
+from app.prompts.router import TOOL_ROUTER_SYSTEM_PROMPT
+from app.services.user_db import UserDBService, get_user_db_service
+
+
+class ToolDecision(BaseModel):
+    action: Literal["user_db_only", "vector_db_only", "user_db_then_vector_db", "plain_answer"]
+    reason: str = Field(default="")
+    user_db_fields: List[str] = Field(default_factory=list)
+    search_query_hint: str = Field(default="")
 
 
 class AgentOrchestrator:
-    def __init__(self, vector_store: VectorStoreService):
+    def __init__(self, vector_store: VectorStoreService, user_db: Optional[UserDBService] = None):
         self.vector_store = vector_store
+        self.user_db = user_db or get_user_db_service()
+
+    async def decide_tools(self, *, user_message: str) -> ToolDecision:
+        client, model = await get_openai_client()
+
+        available_user_fields = [
+            "grade",
+            "course_of_study",
+            "previous_scores",
+            "strengths",
+            "weaknesses",
+            "recent_topics",
+        ]
+
+        system_prompt = TOOL_ROUTER_SYSTEM_PROMPT.format(
+            available_user_fields=json.dumps(available_user_fields),
+            user_message=user_message,
+        )
+
+        res = await client.chat.completions.create(
+            model=model,
+            messages=[{"role": "system", "content": system_prompt}],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+
+        raw = (res.choices[0].message.content or "").strip()
+        try:
+            parsed = json.loads(raw)
+            return ToolDecision.model_validate(parsed)
+        except Exception:
+            # Safe fallback: use retrieval
+            return ToolDecision(action="vector_db_only", reason="fallback", user_db_fields=[], search_query_hint="")
 
     async def handle_query(
         self,
@@ -23,13 +69,11 @@ class AgentOrchestrator:
         selected_slugs: List[str],
     ) -> Dict[str, Any]:
         """
-        POC: `selected_slugs` is treated as selected_article_ids for backwards compatibility.
-        Exactly ONE id is supported.
+        POC:
         """
         article_ids = selected_slugs
 
         pending = agent_state.get_pending(session_id, user_id=user_id)
-
         if pending:
             logger.info(f"Resolving clarification for session {session_id}")
             decision = await self.resolve_clarification(
@@ -49,11 +93,8 @@ class AgentOrchestrator:
                     question=decision.clarifying_question or pending.clarifying_question,
                 )
 
-            return await self.execute_retrieval(
-                query=pending.original_question,
-                article_ids=article_ids,
-                intent=decision.intent,
-            )
+            # Continue with normal tool routing + retrieval path
+            message = pending.original_question
 
         if len(article_ids) != 1:
             return await self.set_uncertain_state(
@@ -64,7 +105,38 @@ class AgentOrchestrator:
                 question="Please select exactly one article_id for this question.",
             )
 
-        return await self.execute_retrieval(query=message, article_ids=article_ids, intent="single")
+        tool_decision = await self.decide_tools(user_message=message)
+        logger.info(f"[tool_router] action={tool_decision.action} reason={tool_decision.reason!r}")
+
+        user_profile: Optional[dict] = None
+        if tool_decision.action in ("user_db_only", "user_db_then_vector_db"):
+            prof = self.user_db.get_user_profile(user_id=user_id)
+            user_profile = prof.data if prof else None
+
+        if tool_decision.action == "plain_answer":
+            return {
+                "type": "plain_answer",
+                "plan": tool_decision.model_dump(),
+                "user_profile": user_profile,
+                "message": "No retrieval required for this question (POC: answer step not implemented here).",
+            }
+
+        if tool_decision.action == "user_db_only":
+            return {
+                "type": "user_db_result",
+                "plan": tool_decision.model_dump(),
+                "user_profile": user_profile,
+            }
+
+        # vector_db_only OR user_db_then_vector_db
+        retrieval = await self.execute_retrieval(
+            query=message,
+            article_ids=article_ids,
+            intent="single",
+        )
+        retrieval["plan"] = tool_decision.model_dump()
+        retrieval["user_profile"] = user_profile
+        return retrieval
 
     async def resolve_clarification(
         self,
