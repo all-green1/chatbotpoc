@@ -4,10 +4,7 @@ from typing import List, Dict, Any
 from loguru import logger
 import json
 
-from pydantic import BaseModel, Field
-
-
-from app.schemas.retrieval import RouterDecision
+from app.schemas.retrieval import RouterDecision, ToolDecision
 from app.services.retrieval import agent_state
 from app.services.retrieval.vector_store import VectorStoreService
 from app.services.utils import get_openai_client
@@ -16,14 +13,6 @@ from app.prompts.rewrite import QUERY_REWRITE_SYSTEM_PROMPT
 from app.prompts.router import TOOL_ROUTER_SYSTEM_PROMPT
 from app.prompts.answer import RAG_ANSWER_SYSTEM_PROMPT
 from app.services.user_db import UserDBService, get_user_db_service
-
-
-class ToolDecision(BaseModel):
-    action: Literal["user_db_only", "vector_db_only", "user_db_then_vector_db", "plain_answer"]
-    reason: str = Field(default="")
-    user_db_fields: List[str] = Field(default_factory=list)
-    search_query_hint: str = Field(default="")
-
 
 class AgentOrchestrator:
     def __init__(self, vector_store: VectorStoreService, user_db: Optional[UserDBService] = None):
